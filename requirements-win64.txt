@@ -1,0 +1,17 @@
+# Standard 64-bit CPython 3.12, 3.13, 3.14, Windows x64. Wheel hashes from PyPI.
+PyQt6==6.12.1 \
+    --hash=sha256:91c3a6a520f3e35e022bb7e05a6bf7d47d5b25eb0f0d6ca9c734c18d12d470ff
+PyQt6-Qt6==6.12.0 \
+    --hash=sha256:a0f3e52fcd014b3d40f4aa856f8cb6843cf13720a2c2f31267f03702bc54d07b
+PyQt6-sip==13.13.1 \
+    --hash=sha256:5413111b1d3bf4e6672b97bfb2cc47eaa781d8e215d96ea2c62733e1373dfe4f \
+    --hash=sha256:f3c7709d928b40aec5aad21edfed16996d180d4471e386dd2356dec76a4b1bd8 \
+    --hash=sha256:f2f18b1410676b6a7651862ce99d17ba56b7c113fdbae2c231b395d69f0224d3
+pillow==13.0.0 \
+    --hash=sha256:ff3fe9eb621fbb9db4c4be33ab946f6bac5f98ab50ca8d3260503653656c961b \
+    --hash=sha256:9dda0788a9932776a75d8bcc020076edc308ce2508b51f6739a45e3158b3fc42 \
+    --hash=sha256:f7cbb7a64e7ec664775195e4f81923bc8a93d9451b963f844e59118f63147a7a
+PyQt6-WebEngine==6.140.1 \
+    --hash=sha256:48aba612359aebb73dd0e03540e8db9d16eedd10b4449c7e1a010337f552f7ac
+PyQt6-WebEngine-Qt6==6.140.0 \
+    --hash=sha256:d03c1e54d3517a455ad6b10ea1e0fee334015def3e490fc70c355aaa2bbc55e6

@@ -1,0 +1,28 @@
+# Local Python installation and build outputs
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Local credentials and settings
+.env
+.env.*
+settings.json
+settings.tmp
+
+# Local ViberHive profile and downloaded content
+media/
+index.sqlite3*
+running.lock
+launcher/
+*.log
+
+# Editor and desktop state
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.pytest_cache/
