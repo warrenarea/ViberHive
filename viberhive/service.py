@@ -11,15 +11,17 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from io import BytesIO
+from hashlib import sha256
 from pathlib import Path
 from weakref import WeakValueDictionary
 
 from . import providers as p
 from .google_query import thumbnail_host
-from .model import provider_page_key
+from .model import provider_page_key, site_icon_url
 from .net import HTTPProblem, Problem, fetch, host_of, web_url
 
 MIB = 1024**2
+THUMBNAIL_WORKERS = 5  # Four ordinary stills plus one priority slot for the hovered GIF.
 PNG = b"\x89PNG\r\n\x1a\n"
 PUBLIC_PERMALINKS = {
     "tenor.com",
@@ -197,6 +199,7 @@ class Service:
         self.download_slots = _MediaSlots(4)
         self.decoder_slots = _MediaSlots(2)
         self.first_frame_ready = None
+        self.early_decoders = threading.BoundedSemaphore(2)
         self.invalid = {}
         self.refusals = {}
         # A poster can use the first frame before the user asks to rebuild the animation.
@@ -207,8 +210,8 @@ class Service:
         self.original_bytes = 0
         self.inline_posters = OrderedDict()
         self.inline_bytes = 0
-        self.thumbnail_downloads = _MediaSlots(3)
-        self.thumbnail_decoders = _MediaSlots(2)
+        self.thumbnail_downloads = _MediaSlots(THUMBNAIL_WORKERS)
+        self.thumbnail_decoders = _MediaSlots(3)
         self.thumbnail_misses = {}
 
     def search(self, source, query, page, seed=""):
@@ -308,9 +311,75 @@ class Service:
                 return self._receive(url, cap)
             return self._receive(url, cap, hosts=hosts)
 
-    @staticmethod
-    def _receive(url, cap, hosts=None):
-        raw, mime = fetch(url, cap, hosts=hosts, accept="image/gif,image/webp,image/png,image/jpeg")
+    def _early_gif_frame(self, url, transfer_done):
+        """Try bounded prefixes of a slow GIF without blocking its transfer or caching partial data."""
+        threshold = 13
+        delivered = threading.Event()
+        decoding = threading.Event()
+        listener = self.first_frame_ready
+        key = sha256(url.encode()).hexdigest()
+
+        def decode(data):
+            nonlocal threshold
+            try:
+                # Normal fast responses reach the existing full decoder immediately.
+                if transfer_done.wait(0.15):
+                    return
+                # The network thread only appends. Snapshot the available bytes
+                # after the grace period so a split header cannot mask frame zero.
+                while not transfer_done.is_set() and len(data) >= threshold:
+                    size = min(len(data), 512 * 1024)
+                    threshold = max(1024, size * 4)
+                    try:
+                        png = self._decode(bytes(data[:size]), "poster")
+                    except Problem:
+                        if size == 512 * 1024:
+                            delivered.set()
+                            return
+                        continue
+                    delivered.set()
+                    listener(key, png)
+                    break
+            except (Problem, OSError, RuntimeError):
+                # The current prefix may not contain a complete first frame yet.
+                pass
+            finally:
+                self.early_decoders.release()
+                decoding.clear()
+
+        def progress(data, mime):
+            if delivered.is_set() or mime not in ("image/gif", "application/octet-stream", "binary/octet-stream", ""):
+                return True
+            if len(data) < 6:
+                return False
+            if not data.startswith((b"GIF87a", b"GIF89a")):
+                return True
+            if len(data) < threshold or decoding.is_set():
+                return False
+            if not self.early_decoders.acquire(blocking=False):
+                return False
+            decoding.set()
+            try:
+                threading.Thread(target=decode, args=(data,),
+                                 name="gif-loading-frame", daemon=True).start()
+            except RuntimeError:
+                self.early_decoders.release()
+                return True
+            return False
+
+        return progress
+
+    def _receive(self, url, cap, hosts=None):
+        accept = "image/gif,image/webp,image/png,image/jpeg"
+        if cap == 24 * MIB and self.first_frame_ready:
+            transfer_done = threading.Event()
+            try:
+                raw, mime = fetch(url, cap, hosts=hosts, accept=accept,
+                                  on_progress=self._early_gif_frame(url, transfer_done))
+            finally:
+                transfer_done.set()
+        else:
+            raw, mime = fetch(url, cap, hosts=hosts, accept=accept)
         if mime not in (
             "image/gif",
             "image/webp",
@@ -379,7 +448,7 @@ class Service:
                 except OSError:
                     frame = None
             if path:
-                if not background and not frame:
+                if not frame and (not background or listener is not None):
                     # Populate an older installation's frame on its first use, offline.
                     try:
                         poster = self._decode_media(path.read_bytes(), "poster", item.media, requested=True)
@@ -470,18 +539,56 @@ class Service:
             return self.prefetch_motion(item)
         return self.ready_motion(item) or self.full(item)
 
-    def _read_poster(self, item):
+    def _read_poster(self, item, *, frame_only=False):
         path = (
             self.store.lookup("frame0:" + item.media, 30)
             if item.media and not item.link_only
             else None
         )
-        if not path:
-            path = self.store.lookup(item.poster_alias, 30)
+        if path or frame_only:
+            return path.read_bytes() if path else None
+        path = self.store.lookup(item.poster_alias, 30)
         inline_alias = "poster:" + (item.media or item.page)
-        if not path and inline_alias != item.poster_alias and not item.link_only:
+        if not path and item.kind != "gif" and inline_alias != item.poster_alias and not item.link_only:
             path = self.store.lookup(inline_alias, 30)
-        return path.read_bytes() if path else None
+        if path:
+            png = path.read_bytes()
+            if self._usable_thumbnail(item, png):
+                return png
+        return None
+
+    @staticmethod
+    def _usable_thumbnail(item, png):
+        return len(png) >= 24 and item.accepts_thumbnail(*struct.unpack_from(">II", png, 16))
+
+    def save_browser_covers(self, frames):
+        # Gallery already validated these small, Chromium-decoded RGBA buffers.
+        from PIL import Image
+
+        for key, (width, height, rgba) in frames.items():
+            alias = "google-preview:" + key
+            if self.store.lookup(alias, touch=False):
+                continue
+            with Image.frombytes("RGBA", (width, height), rgba) as image, BytesIO() as out:
+                image.save(out, "PNG", compress_level=1)
+                self.store.put(alias, out.getvalue(), "png")
+
+    def cached_covers(self, items):
+        covers = {}
+        for item in items:
+            try:
+                png = self._read_poster(item)
+                if png is None:
+                    path = self.store.lookup("google-preview:" + item.key, 30)
+                    if path:
+                        png = path.read_bytes()
+                        if not self._usable_thumbnail(item, png):
+                            continue
+                if png:
+                    covers[item.key] = png
+            except OSError:
+                continue
+        return covers
 
     def offer_posters(self, mapping):
         """Accept small in-document preview candidates. Qt never receives the supplied bytes."""
@@ -516,7 +623,7 @@ class Service:
 
     @staticmethod
     def _google_thumbnail_host(item):
-        return thumbnail_host(item.thumb) if item.thumb and item.thumb != item.media else ""
+        return thumbnail_host(item.thumb) if item.thumb and item.thumb != item.media and not site_icon_url(item.thumb) else ""
 
     def has_google_poster(self, item):
         """A Google thumbnail can load without opening the publisher's original."""
@@ -529,7 +636,7 @@ class Service:
         # Keep small Google thumbnails independent of large animation rebuilds.
         with self.thumbnail_decoders.take(item.media or item.page):
             out = self._decode(data, "poster")
-        if len(out) >= 24 and min(struct.unpack_from(">II", out, 16)) >= 8:
+        if self._usable_thumbnail(item, out) and min(struct.unpack_from(">II", out, 16)) >= 8:
             return out
         return None
 
@@ -587,16 +694,19 @@ class Service:
             except Problem:
                 return None
             if out is not None:
-                self.store.put("poster:" + (item.media or item.page), out, "png")
+                alias = item.poster_alias if item.kind == "gif" else "poster:" + (item.media or item.page)
+                self.store.put(alias, out, "png")
                 return out
         return None
 
-    def _klipy_poster(self, item):
-        for url in dict.fromkeys((item.thumb, item.media)):
-            if url and host_of(url) in p.KLIPY_CDN:
+    def _klipy_poster(self, item, urls):
+        for url in dict.fromkeys(urls):
+            if url and host_of(url) in p.KLIPY_CDN and (url == item.media or not site_icon_url(url)):
                 try:
                     raw = self._download_media(url, 5 * MIB, hosts=p.KLIPY_CDN)
-                    return self._decode_media(raw, "poster")
+                    png = self._decode_media(raw, "poster")
+                    if url == item.media or self._usable_thumbnail(item, png):
+                        return png
                 except HTTPProblem as exc:
                     if exc.code == 429 or url == item.media:
                         raise
@@ -607,9 +717,9 @@ class Service:
 
     def poster(self, item):
         if item.service_media:
-            return self._klipy_poster(item)
+            return self._klipy_poster(item, (item.thumb, item.media))
         try:
-            return self._stored_poster(item)
+            return self._thumbnail(item) or self._media_frame(item, allow_cached_thumbnail=True)
         except Problem:
             # Google can hydrate the tile while a publisher's preview request is
             # in flight. Use that candidate if the remote request just failed.
@@ -618,7 +728,22 @@ class Service:
                 return inline
             raise
 
-    def _stored_poster(self, item):
+    def related_poster(self, item):
+        """Authoritative still. The pane can paint a provider thumbnail while this runs."""
+        if item.service_media:
+            raw = self._download_media(item.media, 24 * MIB, item.media, hosts=p.KLIPY_CDN)
+            return self._decode_media(raw, "poster", item.media)
+        return self._media_frame(item)
+
+    def quick_cover(self, item):
+        """Read a cached frame or fetch only a thumbnail, independent of the original."""
+        if item.service_media:
+            if item.thumb and item.thumb != item.media:
+                return self._klipy_poster(item, (item.thumb,))
+            return None
+        return self._thumbnail(item, independent=True)
+
+    def _thumbnail(self, item, *, independent=False):
         with self._lock(item.poster_alias):
             google_cdn = item.source == p.GOOGLE and not item.link_only and self._google_thumbnail_host(item)
             if google_cdn or (item.source == p.GOOGLE and self.has_inline_poster(item.key)):
@@ -629,9 +754,13 @@ class Service:
                 return cached
             # Prefer an existing normalized original, including when offline.
             full = self.store.lookup(item.full_alias, 120) if not item.link_only else None
-            if not full and not google_cdn and item.thumb and (item.link_only or item.thumb != item.media):
+            if (not full and not google_cdn and item.thumb and not site_icon_url(item.thumb)
+                    and (item.link_only or item.thumb != item.media)):
                 try:
-                    out = self._decode_media(self._download_media(item.thumb, 5 * MIB), "poster")
+                    slots = self.thumbnail_downloads if independent else self.download_slots
+                    with slots.take(item.media or item.page):
+                        raw = self._receive(item.thumb, 5 * MIB)
+                    out = self._decode_thumbnail(raw, item)
                 except HTTPProblem as exc:
                     if item.link_only or (
                         exc.code == 429 and host_of(item.thumb) == host_of(item.media)
@@ -641,24 +770,30 @@ class Service:
                     if item.link_only:
                         raise
                 else:
-                    self.store.put(item.poster_alias, out, "png")
-                    return out
+                    if out is not None:
+                        self.store.put(item.poster_alias, out, "png")
+                        return out
+
+    def _media_frame(self, item, *, allow_cached_thumbnail=False):
         if item.link_only or not item.media:
             raise Problem("No preview supplied.")
-        # Never hold the thumbnail lock while acquiring the full-alias lock.
+        # Serialize with animation downloads. Only the original can populate frame0.
         with self._lock(item.full_alias):
-            cached = self._read_poster(item)
+            # A main-grid thumbnail can arrive while waiting on an earlier request.
+            cached = self._read_poster(item, frame_only=not allow_cached_thumbnail)
             if cached is not None:
                 return cached
             full = self.store.lookup(item.full_alias, 120)
-            data = full.read_bytes() if full else self._original(item.media)
-            # This worker owns the original for this GIF. It can inherit hover priority.
+            if full:
+                data = full.read_bytes()
+            elif item.kind == "gif":
+                url, data = self._animation_original(item, requested=False)
+            else:
+                data = self._original(item.media)
             out = self._decode_media(data, "poster", item.media)
-            if not full and item.kind != "reference":
-                self._keep_original(item.media, data)
-            # A broken thumbnail can be shared across unrelated results. Associate a
-            # locally generated first frame with the original that supplied it.
-            self.store.put("frame0:" + item.media, out, "png")
+            if not full and item.kind == "gif":
+                self._keep_original(url, data)
+            self._save_frame("frame0:" + item.media, out)
             return out
 
     def favorite(self, item, words):

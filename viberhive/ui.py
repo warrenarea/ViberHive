@@ -67,14 +67,17 @@ from .category_art import CategoryArt
 from .clipplay import ClipPlayback
 from .discord_paste import DiscordPaste
 from .folder_bar import FolderBar
-from .gallery import Gallery, MAX_COLUMNS
+from .gallery import Gallery, MAX_COLUMNS, MAX_FREQUENT_ROWS
 from .google_query import search_url
 from .google_results import GoogleResults
 from .hotkeys import GlobalHotkey
 from .model import Item, Page
 from .navigation import History, Location
 from .net import Problem, host_of, web_url
-from .service import MIB
+from .preview_search import related_query
+from .related_pane import RelatedPane
+from .search_previews import SearchPreviews
+from .service import MIB, THUMBNAIL_WORKERS
 from .theme import ASSETS, control_icon, icon
 from .viewer import HoverPreview, ResizeGrip
 
@@ -89,10 +92,13 @@ class Jobs(QObject):
             for name, n in (
                 ("search", 2),
                 ("preview", 3),
-                ("google-still", 3),
+                ("google-still", THUMBNAIL_WORKERS),
+                ("side-still", THUMBNAIL_WORKERS - 1),
                 ("category", 2),
                 ("motion", HOVER_WORKERS),
                 ("motion-disk", 1),
+                ("cover-read", 1),
+                ("cover-write", 1),
                 ("warm", 2),
                 ("action", 2),
                 ("anchor", 1),
@@ -499,6 +505,7 @@ class Picker(QWidget):
         self.preview_tasks = set()
         self.google_still_tasks = set()
         self.google_stills_tried = set()
+        self.saving_covers = set()
         self.firstFrameReady.connect(self.show_first_frame, Qt.ConnectionType.QueuedConnection)
         if hasattr(service, "first_frame_ready"):
             service.first_frame_ready = self.firstFrameReady.emit
@@ -691,6 +698,7 @@ class Picker(QWidget):
         )
         self.folder_bar = FolderBar(self, ProviderBox())
         self.folder_bar.changed.connect(self.refresh_saved_view)
+        self.folder_bar.folderRequested.connect(self.jump_to_folder)
         base.addWidget(self.folder_bar)
         self.scroll = QScrollArea()
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -698,10 +706,22 @@ class Picker(QWidget):
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.board = Gallery()
+        rows = self.settings.values.get("frequent_rows", 2)
+        if type(rows) is int:
+            self.board.frequent_rows = max(1, min(MAX_FREQUENT_ROWS, rows))
+        self.board.frequentRowsChanged.connect(lambda rows: self.save_preference("frequent_rows", rows))
         self.board.setObjectName("board")
         self.scroll.setWidget(self.board)
         self.install_website_actions()
         self.preview = HoverPreview()
+        self.related_pane = RelatedPane(self)
+        self.search_previews = SearchPreviews(self)
+        for gallery in (self.board, self.related_pane.board):
+            gallery.browserCovers.connect(self.save_browser_covers)
+        self.firstFrameReady.connect(self.related_pane.show_first_frame, Qt.ConnectionType.QueuedConnection)
+        self.preview.install_related(self.related_pane)
+        self.related_pane.closeRequested.connect(self.close_related_preview)
+        QApplication.instance().aboutToQuit.connect(self.related_pane.shutdown)
         self.results_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.results_splitter.setObjectName("resultsSplitter")
         self.results_splitter.setChildrenCollapsible(False)
@@ -720,7 +740,7 @@ class Picker(QWidget):
         footer.setObjectName("footer")
         foot = QHBoxLayout(footer)
         foot.setContentsMargins(0, 5, 0, 0)
-        foot.setSpacing(6)
+        foot.setSpacing(4)
         self.back_button = button("", lambda: self.navigate(-1), True)
         self.forward_button = button("", lambda: self.navigate(1), True)
         for control, title in ((self.back_button, "Back"), (self.forward_button, "Forward")):
@@ -736,14 +756,21 @@ class Picker(QWidget):
         self.paste_link = button("Paste source link", self.paste_offered_link)
         self.paste_link.hide()
         foot.addWidget(self.paste_link)
-        self.result_count = label("", "resultCount")
-        foot.addWidget(self.result_count)
         self.google_website = button("Open in browser ↗", self.open_google_website)
         self.google_website.setToolTip("Open this Google Images search in your default browser")
         self.google_website.hide()
         foot.addWidget(self.google_website)
         self.more = button("Load more", self.more_clicked)
         foot.addWidget(self.more)
+        for action in (self.paste_link, self.google_website, self.more):
+            action.setProperty("footerAction", True)
+        self.footer_options = QHBoxLayout()
+        self.footer_options.setSpacing(12)
+        self.footer_options.addWidget(self.auto_animate)
+        self.footer_options.addWidget(self.folder_bar.auto)
+        foot.addLayout(self.footer_options)
+        self.result_count = label("", "resultCount")
+        foot.addWidget(self.result_count)
         self.settings_button = button("", self.preferences, True)
         self.settings_button.setAccessibleName("Settings")
         self.settings_button.setToolTip("Settings and API keys")
@@ -756,6 +783,7 @@ class Picker(QWidget):
         self.board.activate.connect(self.choose)
         self.board.star.connect(self.toggle_star)
         self.board.related.connect(self.open_related)
+        self.board.previewRelated.connect(self.open_related_preview)
         self.board.menu.connect(self.card_menu)
         self.board.hovered.connect(self.hover)
         self.scroll.verticalScrollBar().valueChanged.connect(self.scrolled)
@@ -874,9 +902,7 @@ class Picker(QWidget):
     def open_related(self, item):
         if item.kind not in ("gif", "reference"):
             return
-        title = item.title.strip() or self.store.favorite_words(item.key)
-        if not title and self.tab == "GIFs":
-            title = self.query
+        title = related_query(self, item)
         if not title:
             self.status.action("This image has no title or saved search phrase.")
             return
@@ -884,6 +910,22 @@ class Picker(QWidget):
             with QSignalBlocker(self.google_mode):
                 self.google_mode.setCurrentIndex(0)
         self.tab_changed("GIFs", search=title)
+
+    def open_related_preview(self, item):
+        if item.kind != "gif" or self.is_clip_view():
+            return
+        query = related_query(self, item)
+        if not query:
+            self.status.action("This GIF has no title or saved search phrase.")
+            return
+        self.related_pane.open_search(item, query, self.source.currentText())
+        self.sync_preview_panel()
+
+    def close_related_preview(self):
+        if self.related_pane.active:
+            self.related_pane.clear()
+            self.sync_preview_panel()
+            self.refresh_preview()
 
     def open_visual_matches(self, item):
         if not self.is_google_tab() or not self.query or self.board.home:
@@ -1087,6 +1129,7 @@ class Picker(QWidget):
             windows.restore(self.previous)
 
     def hideEvent(self, event):
+        self.close_related_preview()
         self.clips.clear()
         self.remember_move()
         self.drag_active = False
@@ -1288,19 +1331,20 @@ class Picker(QWidget):
             self.tab_changed("Favorites")
 
     def tab_changed(self, name, *, search="", restore=None):
+        self.close_related_preview()
         self.remember_visit()
         self.tab = name
         self.tabs[name].setChecked(True)
         self.source.setVisible(name == "GIFs")
         self.clip_source.setVisible(name == "Clips")
         self.favorite_kind.setVisible(name == "Favorites")
-        options = self.folder_bar.options if name == "Favorites" else self.header_options
-        for check in (self.auto_animate, self.clip_autoplay):
-            if options.indexOf(check) < 0:
-                options.insertWidget(0, check)
+        options = self.footer_options if name == "Favorites" else self.header_options
+        if options.indexOf(self.clip_autoplay) < 0:
+            options.insertWidget(0, self.clip_autoplay)
         clip_view = self.is_clip_view()
         self.auto_animate.setVisible(not clip_view)
         self.clip_autoplay.setVisible(clip_view)
+        self.folder_bar.auto.setVisible(name == "Favorites")
         self.search_button.setToolTip("Filter the selected favorites folder" if name == "Favorites" else "Search now")
         self.add_url.setVisible(name == "Favorites" and not clip_view)
         self.folder_bar.setVisible(name == "Favorites")
@@ -1367,6 +1411,7 @@ class Picker(QWidget):
         self.restore_position(restore)
 
     def text_changed(self, text):
+        self.close_related_preview()
         self.clear_search.setVisible(bool(text))
         self.clear_link_offer()
         self.search_delay.stop()
@@ -1401,6 +1446,22 @@ class Picker(QWidget):
     def search_draft(self):
         if self.has_draft():
             self.submit()
+
+    def jump_to_folder(self, folder_id):
+        selector = self.folder_bar.selector
+        index = selector.findData(folder_id)
+        if index < 0:
+            return
+        scrollbar = self.scroll.verticalScrollBar()
+        if selector.currentData() is None:
+            title = selector.itemText(index)
+            for rect, heading in self.board.section_rows:
+                if heading == title:
+                    scrollbar.setValue(rect.top() - 4)
+                    return
+        # Newest-first views and folders with no matching section use the normal folder filter.
+        selector.setCurrentIndex(index)
+        scrollbar.setValue(0)
 
     def show_favorites(self, *, restore=None):
         self.reset_view()
@@ -1451,16 +1512,21 @@ class Picker(QWidget):
     def show_gif_home(self):
         self.hover(-1)
         self.category_art.refresh()
-        self.board.show_categories(self.store.search_categories(), self.store.frequent_gifs(2 * MAX_COLUMNS))
+        capacity = MAX_FREQUENT_ROWS * MAX_COLUMNS
+        self.board.show_categories(self.store.search_categories(), self.store.frequent_gifs(capacity))
 
     def favorites_changed(self):
         self.board.favorite_keys = self.store.favorite_ids()
+        self.related_pane.favorites_changed()
         if self.tab == "Favorites":
             self.folder_bar.reload()
-        self.refresh_saved_view()
+            self.show_favorites(restore=self.displayed_visit)
+        else:
+            self.refresh_saved_view()
         self.board.update()
 
     def submit(self, *, record_search=True, restore=None):
+        self.close_related_preview()
         self.search_delay.stop()
         if self.tab == "Favorites":
             return self.show_favorites()
@@ -1491,6 +1557,7 @@ class Picker(QWidget):
             self.restore_position(restore)
 
     def show_google(self, location, restore=None):
+        self.close_related_preview()
         self.reset_view()
         self.query = location.query
         if self.edit.text() != self.query:
@@ -1694,7 +1761,7 @@ class Picker(QWidget):
         batch = [self.buffered.popleft() for _ in range(min(24, len(self.buffered)))]
         if batch:
             self.consider_search_cover(batch)
-            self.board.extend(batch)
+            self.extend_search_results(self.board, batch)
 
     def consider_search_cover(self, items):
         visit = self.displayed_visit
@@ -1852,6 +1919,8 @@ class Picker(QWidget):
     def auto_animate_changed(self, checked):
         self.save_preference("auto_animate", checked)
         self.update_animation_visibility()
+        self.related_pane.animations.viewport_changed()
+        self.search_previews.schedule()
 
     def remember_preview_width(self, *_):
         sizes = self.results_splitter.sizes()
@@ -1860,6 +1929,8 @@ class Picker(QWidget):
 
     def preview_side_changed(self, _index):
         self.save_preference("preview_side", self.preview_side.currentData())
+        if self.preview_side.currentData() == "off":
+            self.close_related_preview()
         self.sync_preview_panel()
 
     def is_clip_view(self):
@@ -1870,7 +1941,9 @@ class Picker(QWidget):
         side = self.preview_side.currentData()
         self.clip_autoplay.setVisible(self.is_clip_view())
         self.clip_autoplay.setEnabled(side != "off")
-        if side == "off" or self.board.home or not self.board.items:
+        if self.related_pane.active and side == "off":
+            side = "left"
+        if not self.related_pane.active and (side == "off" or self.board.home or not self.board.items):
             self.preview.hide()
             return
         new_index = 0 if side == "left" else 1
@@ -1886,6 +1959,8 @@ class Picker(QWidget):
             splitter.setSizes(sizes if new_index == 0 else sizes[::-1])
 
     def refresh_preview(self):
+        if self.related_pane.active:
+            return
         i = self.motion_target
         if hasattr(self, "clips") and self.clips.item is not None:
             i = self.clips.index
@@ -1902,6 +1977,50 @@ class Picker(QWidget):
 
     def update_animation_visibility(self):
         self.animations.viewport_changed()
+
+    def save_browser_covers(self, frames):
+        if self.jobs.closed:
+            return
+        # A fast sequence of searches can paint immediately and skip optional disk writes
+        # whenever the queue already holds 48 thumbnails.
+        capacity = 48 - len(self.saving_covers)
+        batch = dict(islice(((k, v) for k, v in frames.items() if k not in self.saving_covers), capacity))
+        if batch:
+            self.saving_covers.update(batch)
+            self.jobs.run("cover-write", lambda: self.svc.save_browser_covers(batch),
+                          lambda *_: self.saving_covers.difference_update(batch))
+
+    def extend_search_results(self, board, items):
+        board.extend_search(items)
+        self.search_previews.schedule()
+
+    def restore_search_covers(self, board, items):
+        # Local stills can paint independently of thumbnail and animation transfers.
+        current = board.items
+        wanted = [it for it in items if it.kind == "gif" and not it.link_only and it.key not in board.google_thumbs]
+
+        def paint(covers, error):
+            if current is not board.items:
+                return
+            board.cover_batches -= 1
+            self.search_previews.schedule()
+            if error or not isinstance(covers, dict) or not covers:
+                return
+            for key, png in covers.items():
+                if key not in board.google_thumbs:
+                    pix = QPixmap()
+                    if pix.loadFromData(png, "PNG"):
+                        board.remember_thumbnail(key, pix)
+            board.update()
+            if board is self.board:
+                self.refresh_preview()
+
+        for offset in range(0, len(wanted), 6):
+            group = wanted[offset:offset + 6]
+            future = self.jobs.run("cover-read", lambda group=group: self.svc.cached_covers(group), paint)
+            if future is not None:
+                board.cover_batches += 1
+                board.cover_reads.add(future)
 
     def show_first_frame(self, key, png):
         if self.jobs.closed or not self.isVisible():
@@ -1921,6 +2040,7 @@ class Picker(QWidget):
 
     def load_posters(self):
         self.update_animation_visibility()
+        self.search_previews.schedule()
         if not self.isVisible():
             return
         viewport = self.scroll.viewport()
@@ -1949,6 +2069,8 @@ class Picker(QWidget):
                 del self.board.pix[i]
         has_google_poster = getattr(self.svc, "has_google_poster", None)
         for i in candidates:
+            if i in self.board.search_gifs:
+                continue
             item = self.board.items[i]
             ticket = (self.epoch, i, item.key)
             if i in self.board.pix or ticket in self.google_still_tasks:
@@ -1959,7 +2081,7 @@ class Picker(QWidget):
                     and has_google_poster is not None and has_google_poster(item) is True)
             if fast:
                 # Keep one thumbnail worker available for a newly hovered result.
-                if len(self.google_still_tasks) >= (3 if i == self.motion_target else 2):
+                if len(self.google_still_tasks) >= THUMBNAIL_WORKERS - int(i != self.motion_target):
                     continue
                 tasks, lane = self.google_still_tasks, "google-still"
                 self.google_stills_tried.add(ticket[2])
@@ -2148,13 +2270,14 @@ class Picker(QWidget):
         item = self.board.items[i]
         self.set_favorite(item, remove=item.key in self.board.favorite_keys)
 
-    def set_favorite(self, item, remove):
+    def set_favorite(self, item, remove, *, words=None):
         if item.kind == "reference":
             return
         key = item.key
         if key in self.favorite_tasks:
             return
-        words = self.query
+        if words is None:
+            words = self.query
         self.favorite_tasks.add(key)
         self.status.action("Removing favorite…" if remove else "Saving favorite…")
 

@@ -6,6 +6,7 @@ import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+from itertools import islice
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -333,6 +334,7 @@ class _Operation:
     started_reading: float = 0.0
     last_addition: float = 0.0
     items: dict[str, Item] = field(default_factory=dict)
+    announced: dict[str, tuple[str, bool, bool]] = field(default_factory=dict)
     panel_scrolled: bool = False
     next_panel_probe: float = 0.0
     items_before_scroll: int = -1
@@ -350,6 +352,7 @@ class _Operation:
 class GoogleBrowser(QObject):
     """Render Google outside the picker. Only an explicit verification request opens a window."""
 
+    resultsReady = pyqtSignal(object)
     batchFinished = pyqtSignal(object)
     thumbnailsReady = pyqtSignal(str, object)
     returnToPicker = pyqtSignal()
@@ -585,7 +588,32 @@ class GoogleBrowser(QObject):
         # Following a real panel link can start a second network load near the end
         # of a batch. Leave headroom inside the worker client's 24s/45s watchdog.
         self.op = _Operation(kind, deadline, deadline + 8.0, action, target)
-        self.poll.start()
+        self.poll.start(100 if self._progressive(self.op) else POLL_MS)
+
+    def _progressive(self, op):
+        return op.kind == "initial" and op.action == "snapshot" and not self.branch and not self.references
+
+    def _publish_visible(self, op):
+        # Send first-screen metadata and artwork as the document hydrates. The final
+        # batch remains authoritative for ordering, pagination and verification.
+        rows, inline, rendered = [], {}, {}
+        for item in islice(op.items.values(), 32):
+            key = item.key
+            stamp = (item.thumb, key in op.inline_thumbnails, key in op.rendered_thumbnails)
+            previous = op.announced.get(key)
+            if previous == stamp:
+                continue
+            op.announced[key] = stamp
+            rows.append(item)
+            if stamp[1] and not (previous and previous[1]):
+                inline[key] = op.inline_thumbnails[key]
+            if stamp[2] and not (previous and previous[2]):
+                rendered[key] = op.rendered_thumbnails[key]
+        if rows:
+            self.resultsReady.emit(GoogleBatch(self.query, op.kind, "partial", rows,
+                                               inline_thumbnails=inline, rendered_thumbnails=rendered))
+            if rendered:
+                self.poll.setInterval(POLL_MS)
 
     def _finish(self, status, message=""):
         op = self.op
@@ -871,6 +899,8 @@ class GoogleBrowser(QObject):
             if self.held:
                 return
             self.ready = True
+            if self.op and self._progressive(self.op) and not self.op.items:
+                self.op.started_reading = 0.0
             self._tick()
 
     def open_verification(self, center=None):
@@ -993,7 +1023,9 @@ class GoogleBrowser(QObject):
             return
         now = time.monotonic()
         if now >= op.deadline:
-            if op.items:
+            if op.items and not self.ready:
+                self._finish("error", "Google returned some GIFs but timed out loading the page. Choose Retry to continue.")
+            elif op.items:
                 self._finish("ok")
             elif self.branch:
                 self._finish(
@@ -1007,7 +1039,9 @@ class GoogleBrowser(QObject):
             else:
                 self._finish("error", "Google Images timed out. Submit the search again.")
             return
-        if op.pending or not self.ready or self.held or not self._page_matches(page.url()):
+        if op.pending or self.held or not self._page_matches(page.url()):
+            return
+        if not self.ready and not (self._progressive(op) and page.isLoading()):
             return
         action = op.action
         options = self._options(page, op, action)
@@ -1036,6 +1070,7 @@ class GoogleBrowser(QObject):
     def _options(self, page, op, action):
         options = {
             "query": self.query,
+            "loadingDocument": not self.ready,
             "allowStills": self.references or self.branch is not None,
             "branch": self.branch is not None,
             "continuationDocument": bool(self.continuation_url),
@@ -1209,6 +1244,12 @@ class GoogleBrowser(QObject):
                     op.waiting_pixels.pop(source, None)
                 elif isinstance(source, str) and len(source) <= 2048 and len(op.waiting_pixels) < 64:
                     op.waiting_pixels[source] = key
+        if self._progressive(op):
+            self._publish_visible(op)
+            if not self.ready:
+                # A slow subresource can keep the page loading after rows are visible.
+                # Only a finished document can establish ordinary completion or exhaustion.
+                return
         quiet = now - max(op.last_addition, op.started_reading)
         if self.branch:
             if not op.recognized_panel and not self.continuation_url and quiet >= EMPTY_WAIT:

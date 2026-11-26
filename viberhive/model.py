@@ -1,9 +1,17 @@
 import base64
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
+from urllib.parse import unquote, urlsplit
 
 from .net import host_of
+
+
+def site_icon_url(url):
+    path = unquote(urlsplit(url).path).lower()
+    return bool(re.search(r"(?:^|/)(?:favicons?(?:v\d+)?|apple-touch-icon|site[-_]?(?:icon|logo))(?:[./_-]|$)", path)
+                or path.endswith(".ico"))
 
 
 def provider_page_key(provider, mode, query, page=0, seed=""):
@@ -50,7 +58,25 @@ class Item:
 
     @property
     def poster_alias(self):
+        if self.kind == "gif":
+            # Older releases keyed posters by thumbnail URL, which several cards can share.
+            return "gif-cover:" + self.key
         return "poster:" + (self.thumb or self.media or self.page)
+
+    def accepts_thumbnail(self, width, height):
+        """Evaluate provider artwork only. A decoded first frame can be any size."""
+        if self.kind != "gif":
+            return True
+        if (width == height and min(self.width, self.height) > 0
+                and max(self.width, self.height) > 1.5 * min(self.width, self.height)):
+            return False
+        if max(width, height) < MIN_FALLBACK_THUMB_EDGE:
+            # Small landscape/portrait posters can still identify their GIF when
+            # the provider reports the same aspect ratio. Reject badge-sized squares.
+            if max(width, height) < 48 or width == height or not (self.width and self.height):
+                return False
+            return abs(width * self.height - height * self.width) <= .12 * height * self.width
+        return True
 
 
 @dataclass
@@ -85,6 +111,8 @@ class GoogleBatch:
 
 
 GOOGLE_THUMB_EDGE = 160
+# Applies only to fallback artwork. A real GIF can legitimately be smaller.
+MIN_FALLBACK_THUMB_EDGE = 96
 THUMB_BATCH_BYTES = 4 * 1024**2
 THUMB_BATCH_COUNT = 128
 

@@ -1,10 +1,12 @@
 """A painted masonry grid. Only visible tiles need pixmaps or remote previews."""
 
 from collections import OrderedDict
+from time import monotonic
+from weakref import WeakSet
 
-from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtWidgets import QApplication, QScrollArea, QWidget
 
 from .model import GOOGLE_THUMB_EDGE
 from .tile_tip import TileTip
@@ -13,6 +15,7 @@ A = Qt.AlignmentFlag
 NOPEN = Qt.PenStyle.NoPen
 SECTION_FLAGS = A.AlignLeft | A.AlignVCenter | Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere
 MAX_COLUMNS = 6
+MAX_FREQUENT_ROWS = 8
 HOME = [
     ("Favorites", "★", "#6455c9", "#38325f"),
     ("Hello", "👋", "#546d85", "#303d55"),
@@ -56,15 +59,149 @@ def cover(painter, rect, pix):
     painter.drawPixmap(target, pix, source)
 
 
+class FrequentDivider(QWidget):
+    """A section edge that snaps to whole rows of used GIFs."""
+
+    def __init__(self, gallery):
+        super().__init__(gallery)
+        self.gallery = gallery
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.setAccessibleName("Resize Frequently Used")
+        self.setToolTip("Drag down to show more rows or up to show fewer. You can also use the Down and Up keys.")
+        self.setAccessibleDescription(self.toolTip())
+        self.setFixedHeight(24)
+        self.start_point = None
+        self.edge_scroll = QTimer(self, interval=30)
+        self.edge_scroll.timeout.connect(self.scroll_at_edge)
+        self.hide()
+
+    def scroll_area(self):
+        viewport = self.gallery.parentWidget()
+        area = viewport.parentWidget() if viewport else None
+        return area if isinstance(area, QScrollArea) else None
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        self.start_point = event.globalPosition().toPoint()
+        self.pointer = self.start_point
+        self.dragged = False
+        self.direction = 0
+        self.start_y = self.gallery.mapFromGlobal(self.start_point).y()
+        self.start_rows = self.gallery.shown_frequent_rows()
+        self.update()
+        event.accept()
+
+    def follow_pointer(self):
+        distance = self.gallery.mapFromGlobal(self.pointer).y() - self.start_y
+        pitch = self.gallery.frequent_row_pitch
+        steps = (abs(distance) + pitch // 2) // pitch
+        rows = self.start_rows + (steps if distance >= 0 else -steps)
+        self.gallery.resize_frequent_section(rows)
+
+    def mouseMoveEvent(self, event):
+        if self.start_point is None:
+            return super().mouseMoveEvent(event)
+        point = event.globalPosition().toPoint()
+        if point.y() != self.pointer.y():
+            self.direction = point.y() - self.pointer.y()
+        self.pointer = point
+        if abs(point.y() - self.start_point.y()) >= QApplication.startDragDistance():
+            self.dragged = True
+        if self.dragged:
+            self.follow_pointer()
+            if not self.edge_scroll.isActive():
+                self.edge_scroll.start()
+        event.accept()
+
+    def scroll_at_edge(self):
+        area = self.scroll_area()
+        if area is not None:
+            viewport = area.viewport()
+            y = viewport.mapFromGlobal(self.pointer).y()
+            bar = area.verticalScrollBar()
+            value = bar.value()
+            rows = self.gallery.shown_frequent_rows()
+            if (self.direction > 0 and y >= viewport.height() - 24
+                    and rows < self.gallery.available_frequent_rows()):
+                bar.setValue(value + 12)
+            elif self.direction < 0 and y <= 24 and rows > 1:
+                bar.setValue(value - 12)
+            if value != bar.value():
+                self.follow_pointer()
+                return
+        self.edge_scroll.stop()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or self.start_point is None:
+            return super().mouseReleaseEvent(event)
+        self.pointer = event.globalPosition().toPoint()
+        self.follow_pointer()
+        self.start_point = None
+        self.edge_scroll.stop()
+        self.keep_visible()
+        self.update()
+        event.accept()
+
+    def hideEvent(self, event):
+        self.start_point = None
+        self.edge_scroll.stop()
+        super().hideEvent(event)
+
+    def keep_visible(self):
+        area = self.scroll_area()
+        if area is not None:
+            area.ensureWidgetVisible(self, 0, 12)
+
+    def keyPressEvent(self, event):
+        rows = self.gallery.shown_frequent_rows()
+        sizes = {Qt.Key.Key_Up: rows - 1, Qt.Key.Key_Down: rows + 1,
+                 Qt.Key.Key_Home: 1, Qt.Key.Key_End: self.gallery.available_frequent_rows()}
+        if event.key() not in sizes:
+            return super().keyPressEvent(event)
+        self.gallery.resize_frequent_section(sizes[event.key()])
+        self.keep_visible()
+        event.accept()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        active = self.hasFocus() or self.underMouse() or self.start_point is not None
+        middle = self.height() // 2
+        rows = self.gallery.shown_frequent_rows()
+        label = f"{rows} row" if rows == 1 else f"{rows} rows"
+        p.setFont(font(9, True))
+        width = p.fontMetrics().horizontalAdvance(label) + 32
+        grip = QRect((self.width() - width) // 2, 2, width, self.height() - 4)
+        p.setPen(color("#939bc9" if active else "#575a69"))
+        p.drawLine(2, middle, grip.left() - 4, middle)
+        p.drawLine(grip.right() + 4, middle, self.width() - 2, middle)
+        p.setBrush(color("#464a61" if active else "#353741"))
+        p.drawRoundedRect(grip, 6, 6)
+        p.setPen(color("#f4f4ff" if active else "#c5c7d3"))
+        x = grip.left() + 11
+        for dy, tip in ((-2, -5), (2, 5)):
+            p.drawLine(x - 3, middle + dy, x, middle + tip)
+            p.drawLine(x, middle + tip, x + 3, middle + dy)
+        p.drawText(grip.adjusted(19, 0, -4, 0), A.AlignCenter, label)
+
+
 class Gallery(QWidget):
+    card_width_target = 178
     activate = pyqtSignal(int)
     star = pyqtSignal(int)
     related = pyqtSignal(object)
+    previewRelated = pyqtSignal(object)
     menu = pyqtSignal(int, QPoint)
     hovered = pyqtSignal(int)
+    artPainted = pyqtSignal()
+    browserCovers = pyqtSignal(object)
     layoutChanged = pyqtSignal()
+    frequentRowsChanged = pyqtSignal(int)
 
-    def __init__(self):
+    def __init__(self, *, thumbnail_cache=None):
         super().__init__()
         self.tile_tip = TileTip(self)
         self.setMouseTracking(True)
@@ -78,6 +215,8 @@ class Gallery(QWidget):
         self.home_tiles = HOME
         self.category_images = {}
         self.frequent_pool = []
+        self.frequent_rows = 2
+        self.row_divider = FrequentDivider(self)
         self.personal_count = 0
         self.frequent_hint = QRect()
         self.items = []
@@ -86,7 +225,16 @@ class Gallery(QWidget):
         self.section_rows = []
         self.favorite_headings = False
         self.pix = {}
-        self.google_thumbs = OrderedDict()
+        self.cover_reads = WeakSet()
+        self.cover_batches = 0
+        self.search_gifs = set()
+        self.painted_covers = set()
+        self.checked_covers = set()
+        self.cover_attempts = {}
+        self.original_attempts = set()
+        self.autoplay_retries = {}
+        self.cover_grace = 0.0
+        self.google_thumbs = thumbnail_cache if thumbnail_cache is not None else OrderedDict()
         self.fail = {}
         self.motion_errors = {}
         self.pressed = None
@@ -97,6 +245,17 @@ class Gallery(QWidget):
         self.setMinimumWidth(180)
 
     def reset(self, home=False, items=(), sections=None, *, favorite_headings=False):
+        for future in list(self.cover_reads):
+            future.cancel()
+        self.cover_reads.clear()
+        self.cover_batches = 0
+        self.search_gifs.clear()
+        self.painted_covers.clear()
+        self.checked_covers.clear()
+        self.cover_attempts.clear()
+        self.original_attempts.clear()
+        self.autoplay_retries.clear()
+        self.cover_grace = 0.0
         self.tile_tip.cancel()
         self.home = home
         if not home:
@@ -118,9 +277,29 @@ class Gallery(QWidget):
         self.items.extend(items)
         self.reflow()
 
+    def extend_search(self, items):
+        indices = {i for i, it in enumerate(items, len(self.items))
+                   if it.kind == "gif" and not it.link_only}
+        if indices:
+            self.search_gifs.update(indices)
+            self.cover_grace = monotonic() + 0.65
+        self.extend(items)
+
+    def retry_covers(self, keys):
+        for i in list(self.cover_attempts):
+            if self.items[i].key in keys:
+                self.cover_attempts.pop(i)
+
+    def update_sources(self, items):
+        for index, item in enumerate(self.items):
+            if item.key in items and not item.thumb:
+                self.items[index] = items[item.key]
+                self.fail.pop(index, None)
+
     def offer_google_pixels(self, frames):
         """Display the browser's bounded pixel buffers without decoding remote files in Qt."""
-        changed = False
+        accepted = {}
+        matching = {item.key: item for item in self.items if item.key in frames}
         for key, frame in frames.items():
             if not isinstance(frame, (list, tuple)) or len(frame) != 3:
                 continue
@@ -129,15 +308,23 @@ class Gallery(QWidget):
                     or not (8 <= w <= GOOGLE_THUMB_EDGE and 8 <= h <= GOOGLE_THUMB_EDGE)
                     or len(rgba) != 4 * w * h):
                 continue
+            if key not in matching or not matching[key].accepts_thumbnail(w, h):
+                continue
             image = QImage(rgba, w, h, 4 * w, QImage.Format.Format_RGBA8888)
-            self.google_thumbs[key] = QPixmap.fromImage(image.copy())
-            self.google_thumbs.move_to_end(key)
-            changed = True
+            self.remember_thumbnail(key, QPixmap.fromImage(image.copy()))
+            accepted[key] = frame
+        if accepted:
+            self.update()
+            cacheable = {k: frame for k, frame in accepted.items() if matching[k].kind == "gif" and not matching[k].link_only}
+            if cacheable:
+                self.browserCovers.emit(cacheable)
+        return bool(accepted)
+
+    def remember_thumbnail(self, key, pix):
+        self.google_thumbs[key] = pix
+        self.google_thumbs.move_to_end(key)
         while len(self.google_thumbs) > 192:
             self.google_thumbs.popitem(last=False)
-        if changed:
-            self.update()
-        return changed
 
     def image_for(self, index):
         pix = self.motion_frames.get(index, self.pix.get(index))
@@ -156,15 +343,30 @@ class Gallery(QWidget):
         self.personal_count = len(personal)
         self.reset(home=True, items=frequent)
 
+    def available_frequent_rows(self):
+        return min(MAX_FREQUENT_ROWS, (len(self.frequent_pool) + self.cols - 1) // self.cols)
+
+    def shown_frequent_rows(self):
+        return min(self.frequent_rows, self.available_frequent_rows())
+
+    def resize_frequent_section(self, rows):
+        rows = max(1, min(self.available_frequent_rows(), rows))
+        if self.home and rows != self.shown_frequent_rows():
+            self.frequent_rows = rows
+            self.reflow()
+            self.frequentRowsChanged.emit(rows)
+
     def reflow(self):
         gap = 9
         width = max(150, self.width() - 2)
-        self.cols = max(1, min(MAX_COLUMNS, (width + gap) // (178 + gap)))
+        self.cols = max(1, min(MAX_COLUMNS, (width + gap) // (self.card_width_target + gap)))
         cardw = (width - (self.cols - 1) * gap) // self.cols
         tops = [1] * self.cols
         self.positions = []
         self.section_rows = []
         self.frequent_hint = QRect()
+        show_divider = self.home and self.available_frequent_rows() > 1
+        self.row_divider.setVisible(show_divider)
         large = self.home or self.favorite_headings
         self.section_font = font(21 if large else 10, True)
         metrics = QFontMetrics(self.section_font, self)
@@ -180,7 +382,8 @@ class Gallery(QWidget):
 
         changed_capacity = False
         if self.home:
-            count = min(len(self.frequent_pool), 2 * self.cols)
+            self.frequent_row_pitch = max(99, min(152, round(cardw * 0.62))) + gap
+            count = min(len(self.frequent_pool), self.frequent_rows * self.cols)
             changed_capacity = len(self.items) != count
             if changed_capacity:
                 self.items = self.frequent_pool[:count]
@@ -199,11 +402,15 @@ class Gallery(QWidget):
             self.sections[count + 1 + self.personal_count] = "Reactions"
         total = len(self.items) + (len(self.home_tiles) if self.home else 0)
         for i in range(total):
+            if show_divider and i == len(self.items):
+                self.row_divider.setGeometry(1, max(tops) - 3, width, self.row_divider.height())
+                self.row_divider.update()
+                tops = [self.row_divider.geometry().bottom() + 4] * self.cols
             if i in self.sections:
                 tops = [heading(self.sections[i], max(tops))] * self.cols
             col = min(range(self.cols), key=tops.__getitem__)
             if self.home:
-                h = max(99, min(152, round(cardw * 0.62)))
+                h = self.frequent_row_pitch - gap
             else:
                 item = self.items[i]
                 ratio = (item.height / item.width) if item.width and item.height else 0.68
@@ -291,7 +498,11 @@ class Gallery(QWidget):
         self.tile_tip.cancel()
         xy = event.position().toPoint()
         tile = self.hit(xy)
-        if tile >= 0 and event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+        button = event.button()
+        if tile >= 0 and (
+            button in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton)
+            or (button == Qt.MouseButton.MiddleButton and tile < len(self.items) and self.items[tile].kind == "gif")
+        ):
             self.pressed = (tile, event.button(), xy, self.action_at(tile, xy))
             event.accept()
         else:
@@ -314,7 +525,9 @@ class Gallery(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and action != pressed[3]:
             return
         self.selected = i
-        if i < len(self.items) and (event.button() == Qt.MouseButton.RightButton or action == "menu"):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.previewRelated.emit(self.items[i])
+        elif i < len(self.items) and (event.button() == Qt.MouseButton.RightButton or action == "menu"):
             self.menu.emit(i, event.globalPosition().toPoint())
         elif event.button() == Qt.MouseButton.LeftButton:
             if action == "related":
@@ -454,6 +667,9 @@ class Gallery(QWidget):
         p.fillRect(r, color("#26272e"))
         if pix and not pix.isNull():
             cover(p, img, pix)
+            if i in self.search_gifs and i not in self.painted_covers:
+                self.painted_covers.add(i)
+                self.artPainted.emit()
             if i in self.motion_errors and i in (self.hot, self.selected):
                 strip = img.adjusted(0, img.height() - 24, 0, 0)
                 p.fillRect(strip, QColor(27, 28, 36, 218))

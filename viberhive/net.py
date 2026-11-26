@@ -173,7 +173,7 @@ def public_addresses(host):
     return list(dict.fromkeys(record[4][0] for record in records))
 
 
-def fetch(url, limit, *, hosts=None, accept="*/*", deadline=16, redirects=3):
+def fetch(url, limit, *, hosts=None, accept="*/*", deadline=16, redirects=3, on_progress=None):
     end = time.monotonic() + deadline
     for step in range(redirects + 1):
         p, host = parts(url)
@@ -248,6 +248,7 @@ def fetch(url, limit, *, hosts=None, accept="*/*", deadline=16, redirects=3):
                 length = response.getheader("Content-Length")
                 if length and (not length.isdecimal() or len(length) > 12 or int(length) > limit):
                     raise Problem("The response exceeds the download limit.")
+                mime = response.getheader("Content-Type", "").split(";")[0].strip().lower()
                 data = bytearray()
                 while len(data) <= limit and not response.isclosed():
                     tls_sock.settimeout(remaining())
@@ -255,11 +256,12 @@ def fetch(url, limit, *, hosts=None, accept="*/*", deadline=16, redirects=3):
                     if not chunk:
                         break
                     data.extend(chunk)
+                    if on_progress and len(data) < limit and (not length or len(data) < int(length)):
+                        if on_progress(data, mime):
+                            on_progress = None
                 if len(data) > limit or (length and len(data) != int(length)):
                     raise Problem("The download is incomplete or too large.")
-                return bytes(data), response.getheader("Content-Type", "").split(";")[
-                    0
-                ].strip().lower()
+                return bytes(data), mime
         except (OSError, http.client.HTTPException):
             raise Problem(
                 "Could not complete the secure connection. Check the network or try again."

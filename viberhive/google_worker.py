@@ -48,6 +48,7 @@ def pack_thumbnails(frames):
 class GoogleClient(QObject):
     """The picker owns only this pipe and the native grid. No browser window owns the picker."""
 
+    resultsReady = pyqtSignal(object)
     batchFinished = pyqtSignal(object)
     thumbnailsReady = pyqtSignal(str, object)
     verificationResumed = pyqtSignal()
@@ -238,8 +239,11 @@ class GoogleClient(QObject):
                     packet.get("parent_identity", ""),
                     unpack_thumbnails(packet.get("rendered")),
                 )
-                self.timer.stop()
-                self.batchFinished.emit(batch)
+                if batch.status == "partial":
+                    self.resultsReady.emit(batch)
+                else:
+                    self.timer.stop()
+                    self.batchFinished.emit(batch)
                 if p is not self.process:
                     return
             if len(self.buffer) > MAX_REPLY:
@@ -384,6 +388,8 @@ def run_worker(browser_factory=None):
             browser.pause()
 
     commands.received.connect(handle, Qt.ConnectionType.QueuedConnection)
+    if hasattr(browser, "resultsReady"):
+        browser.resultsReady.connect(reply)
     browser.batchFinished.connect(reply)
     browser.thumbnailsReady.connect(
         lambda query, frames: write(line({"id": generation, "query": query, "event": "thumbnails",

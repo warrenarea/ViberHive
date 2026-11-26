@@ -13,6 +13,7 @@ QFrame#panel { background:#35363d; border:1px solid #51525e; border-radius:12px;
 QWidget#head { background:transparent; }
 QLabel#resultCount { color:#c3c5d2; font-weight:600; padding:0 4px; }
 QFrame#footer { border:0; border-top:1px solid #474851; }
+QPushButton[footerAction="true"] { padding-left:5px; padding-right:5px; }
 QLabel#small { font-size:12px; color:#b5b7c4; }
 QPushButton, QToolButton, QComboBox {
  background:#42434c; color:#eaebf2; border:1px solid transparent;

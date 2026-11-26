@@ -6,6 +6,11 @@
     const cardSelector = "[data-docid],[data-tbnid],[data-lpage],[data-iurl],[data-ou]";
     const searchHost = ["www.google.com","images.google.com","google.com"].includes(location.hostname);
     const accessOnly = options.action === "verified" || options.action === "access";
+    // Qt can announce the destination while the previous or empty document is still current.
+    if (options.loadingDocument && (!document.body || !searchHost ||
+            normalize(new URL(location.href).searchParams.get("q") || "") !== normalize(options.query))) {
+        return {state: "pending"};
+    }
     if (!searchHost && !["sorry.google.com","consent.google.com"].includes(location.hostname)) {
         return accessOnly ? "waiting" : {state: "interaction"};
     }
@@ -75,8 +80,9 @@
         const empty = /\bno (?:matching images|(?:image )?results (?:found|for))\b|\bdid not match any (?:images|documents)\b/i.test(text);
         return hasVisibleResult || empty ? "results" : "waiting";
     }
+    if (!document.body) return {state: "pending"};
     const candidateSelector = cardSelector + ',a[href*="imgurl="],a[href] img,img[data-original],img.sFlh5c,img[jsname="kn3ccd"]';
-    const lazyAttributes = ["data-src","data-deferred-src","data-lazy-src","data-original"];
+    const lazyAttributes = ["data-src","data-deferred-src","data-lazy-src","data-thumb","data-thumbnail-url","data-original"];
     const findUrl = value => {
         if (!value || typeof value !== "string" || value.length > 8192) return "";
         try {
@@ -84,6 +90,10 @@
             const u = new URL(value);
             return u.protocol === "https:" && !u.username && !u.password && (!u.port || u.port === "443") ? u.href : "";
         } catch { return ""; }
+    };
+    const resolvePreview = raw => {
+        if (!raw || typeof raw !== "string" || raw.length > 8192) return "";
+        try { return findUrl(new URL(raw, document.baseURI).href); } catch { return ""; }
     };
     const inlineBytes = value => {
         if (typeof value !== "string" || value.length < 45 || value.length > 87420) return "";
@@ -164,7 +174,7 @@
             }
         });
         state.observer.observe(document.documentElement, {subtree: true, childList: true,
-            characterData: true, attributes: true, attributeFilter: ["src","srcset","sizes","data-srcset",
+            characterData: true, attributes: true, attributeFilter: ["src","srcset","sizes","data-srcset","data-tu","data-thumb-url","poster",
             ...lazyAttributes,"data-deferred","href","id","data-docid","data-ref-docid","data-tbnid","data-lpage","data-iurl","data-ou","alt","aria-label","aria-expanded","aria-hidden","aria-controls","hidden","style","class"]});
         globalThis.vhImages = state;
     }
@@ -212,7 +222,7 @@
                         const thumbnail = match[2] && match[2].length <= 87420 ? JSON.parse(match[2]) : "";
                         const inline = state.deferredBytes < 3 * 1024 * 1024 ? inlineBytes(thumbnail) : "";
                         state.deferredBytes += inline.length;
-                        state.images.set(match[1], {media: original, thumb: findUrl(thumbnail),
+                        state.images.set(match[1], {media: original, thumb: resolvePreview(thumbnail),
                             inline, width: +match[5], height: +match[4]});
                     }
                 } catch { /* Another layout can still expose an original on the image or its link. */ }
@@ -220,10 +230,36 @@
         }
     };
     const imageForRow = new WeakMap();
+    // A result card can put its publisher's favicon before the actual artwork.
+    const faviconUrl = value => typeof value === "string" && !value.startsWith("data:") &&
+        /\/(?:favicons?(?:v\d+)?|apple-touch-icon|site[-_]?(?:icon|logo))(?:[./_?#-]|$)|\.ico(?:[?#]|$)/i.test(value);
+    const smallSquare = img => img.naturalWidth > 0 && img.naturalWidth === img.naturalHeight && img.naturalWidth < 96;
+    const siteIcon = img => faviconUrl(img.currentSrc) || faviconUrl(img.getAttribute("src")) ||
+        faviconUrl(img.getAttribute("data-src")) ||
+        /^(?:favicon|(?:site|website|publisher|source) (?:icon|logo))$/i.test(img.alt.trim()) ||
+        (img.width > 0 && img.height > 0 && Math.max(img.width, img.height) <= 48 &&
+            Math.max(img.naturalWidth, img.naturalHeight) > 2 * Math.max(img.width, img.height));
+    const cardImage = element => {
+        if (!element) return null;
+        if (element.matches("img")) return siteIcon(element) ? null : element;
+        const first = element.querySelector("img");
+        if (!first) return null;
+        // A 256px site logo is often drawn at 16px. Compare its displayed area
+        // with the result artwork before consulting intrinsic image dimensions.
+        const area = img => (img.width || img.naturalWidth) * (img.height || img.naturalHeight);
+        let best = siteIcon(first) ? null : first;
+        if (best && !smallSquare(best) && Math.min(best.width, best.height) > 48) return best;
+        for (const img of element.querySelectorAll("img")) {
+            if (siteIcon(img)) continue;
+            if (!best || (smallSquare(best) !== smallSquare(img) ? !smallSquare(img) : area(img) > area(best))) best = img;
+        }
+        return best;
+    };
     const inspect = node => {
         if (!(node instanceof Element)) return null;
         const card = node.closest(cardSelector);
-        const img = node.closest("img") || node.querySelector("img") || card?.querySelector("img");
+        if (node.matches("img") && siteIcon(node)) return null;
+        const img = cardImage(node) || cardImage(card);
         const anchor = node.closest("a[href]") || img?.closest("a[href]") ||
             card?.querySelector('a[href*="imgurl="]');
         let linkParams;
@@ -256,23 +292,54 @@
         if (!media && !page) return null;
         const title = tidy(img?.alt || card?.querySelector("[role=heading],h3")?.textContent ||
             anchor?.title || card?.getAttribute("aria-label"));
-        const previewSources = lazyAttributes.map(name => img?.getAttribute(name));
-        // Chromium resolves live srcset and <picture> to currentSrc. Some cards keep the
-        // source set in a lazy attribute before assigning it to the browser.
-        const srcset = img?.getAttribute("data-srcset");
-        if (srcset && srcset.length <= 180000) {
-            for (const entry of srcset.split(/,\s*(?=data:image\/|https:\/\/)/i, 3))
-                previewSources.push(entry.trim().split(/\s+/, 1)[0]);
+        const distinctStill = (raw, namedThumbnail = false) => {
+            const url = resolvePreview(raw);
+            if (!url || url === media || url === page || faviconUrl(url)) return "";
+            const u = new URL(url);
+            if (["google.com","www.google.com","images.google.com"].includes(u.hostname)) {
+                // A search or image viewer link is a document, even when it names a thumbnail.
+                return u.pathname === "/images" && u.searchParams.has("q") ? url : "";
+            }
+            if (googleThumb(url) || namedThumbnail) return url;
+            // A publisher's responsive still is often hosted separately from the original GIF.
+            return /\.(?:jpe?g|png|webp)$/i.test(u.pathname) ||
+                /^(?:jpg|jpeg|png|webp)$/i.test(u.searchParams.get("format") || u.searchParams.get("fm") || "")
+                ? url : "";
+        };
+        const previewSources = [];
+        if (img && !smallSquare(img)) previewSources.push(img.currentSrc, img.getAttribute("src"));
+        previewSources.push(...lazyAttributes.map(name => img?.getAttribute(name)));
+        previewSources.push(card?.dataset.tu, card?.dataset.thumbUrl, card?.dataset.thumbnailUrl, card?.dataset.thumb);
+        const picture = img?.closest("picture");
+        const sets = [img?.getAttribute("data-srcset"), img?.getAttribute("srcset")];
+        for (const source of picture?.querySelectorAll("source") || []) {
+            sets.push(source.getAttribute("data-srcset"), source.getAttribute("srcset"));
         }
-        previewSources.push(img?.getAttribute("src"), img?.currentSrc);
-        let thumb = meta?.thumb || "";
+        for (const srcset of sets) {
+            if (srcset && srcset.length <= 180000) {
+                for (const entry of srcset.split(/,\s*(?=(?:data:image\/|https?:|\/))/i, 6))
+                    previewSources.push(entry.trim().split(/\s+/, 1)[0]);
+            }
+        }
+        if (!img || smallSquare(img) || !img.currentSrc || img.naturalWidth <= 1) {
+            // Limit background/poster reads to artwork identified inside this result.
+            const art = card?.matches('[role="img"],[style*="background"]') ? card :
+                card?.querySelector('[role="img"],[style*="background-image"]');
+            if (art) {
+                const bg = getComputedStyle(art).backgroundImage;
+                const imageUrl = /^url\(\s*["']?(.*?)["']?\s*\)$/.exec(bg)?.[1];
+                if (imageUrl) previewSources.push(imageUrl);
+            }
+            const poster = card?.querySelector("video[poster]")?.getAttribute("poster");
+            if (poster) previewSources.push(poster);
+        }
+        let thumb = [meta?.thumb, metaUrl(anchor, "tbnurl"), card?.dataset.tu,
+            card?.dataset.thumbUrl, card?.dataset.thumbnailUrl, card?.dataset.thumb]
+            .map(value => distinctStill(value, true)).find(Boolean) || "";
         let inline = "";
         for (const value of previewSources) {
             if (!inline) inline = inlineBytes(value);
-            if (!thumb) {
-                const url = findUrl(value);
-                if (url && googleThumb(url)) thumb = url;
-            }
+            if (!thumb) thumb = distinctStill(value);
             if (inline && thumb) break;
         }
         inline ||= state.deferred.get(img?.id) || meta?.inline || "";
@@ -289,7 +356,7 @@
         return box.width > 4 && box.height > 4 && getComputedStyle(element).visibility !== "hidden";
     };
     const renderedPixels = (img, budget) => {
-        if (!(img instanceof HTMLImageElement) || !img.complete || !img.currentSrc ||
+        if (!(img instanceof HTMLImageElement) || !img.complete || !img.currentSrc || smallSquare(img) ||
                 img.naturalWidth < 8 || img.naturalHeight < 8 ||
                 state.unreadable.get(img) === img.currentSrc) return null;
         // Chromium has already decoded this tile. Read a small first paint without
@@ -409,11 +476,21 @@
         const card = node.closest(cardSelector) || node;
         const panel = scopes.find(el => el.contains(node));
         if (continued && (panel || !main.contains(node) || node.closest('header,footer,nav,[role="navigation"]'))) continue;
-        if (!rows.has(key)) rows.set(key, row);
+        const prior = rows.get(key);
+        if (!prior) rows.set(key, row);
+        else {
+            // Nested markup may expose the original address first and its preview on a later node.
+            prior.thumb ||= row.thumb;
+            prior.inline ||= row.inline;
+            const candidate = imageForRow.get(row);
+            const first = imageForRow.get(prior);
+            if (candidate && (!first || first.naturalWidth < 8 || smallSquare(first)) &&
+                    candidate.naturalWidth >= 8 && !smallSquare(candidate)) imageForRow.set(prior, candidate);
+        }
         if (!panel) gridCards.add(card);
         const occurrence = {key, row, card, panel, target: null};
         entries.push(occurrence);
-        const image = card.matches("img") ? card : card.querySelector("img");
+        const image = cardImage(card);
         if (!visible(image)) continue;
         let control = image.closest('button,[role="button"][jsaction]');
         const anchor = image.closest("a[href]");

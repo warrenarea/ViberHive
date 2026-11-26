@@ -77,6 +77,8 @@ class GoogleResults(QObject):
                 self.browser = self.make_browser()
             except (ImportError, OSError):
                 return False
+            if hasattr(self.browser, "resultsReady"):
+                self.browser.resultsReady.connect(self.received)
             self.browser.batchFinished.connect(self.received)
             if hasattr(self.browser, "thumbnailsReady"):
                 self.browser.thumbnailsReady.connect(self.rendered_ready)
@@ -126,6 +128,8 @@ class GoogleResults(QObject):
         self.ready = self.exhausted = False
         self.blocked = self.inflight = ""
         self.items = {}
+        self.streamed_count = 0
+        self.recover_covers = False
         self.late_posters = set()
         self.requested = NO_REQUEST
         self.current_target = None
@@ -156,6 +160,7 @@ class GoogleResults(QObject):
             self.sync()
             return True
         if saved and saved.items and age < CACHE_TTL:
+            self.recover_covers = not (self.branch or self.references)
             # A fresh grid with a full runway needs no network until the user browses it.
             self.warm_left = int(self.branch is not None and not self.exhausted)
             self.prefetch.start()
@@ -175,7 +180,13 @@ class GoogleResults(QObject):
         self.sync()
         return True
 
+    def refresh_missing_covers(self):
+        if (self.active and self.recover_covers and not self.paused
+                and not self.ready and not self.inflight and not self.blocked):
+            self.begin_search()
+
     def begin_search(self):
+        self.recover_covers = False
         if not self.ensure_browser():
             if not (self.items or self.yarn_clips or self.branch or self.references):
                 self.reset()
@@ -187,6 +198,7 @@ class GoogleResults(QObject):
             )
             return
         self.inflight = "initial"
+        self.streamed_count = 0
         self.ready = False
         self.picker.status.setText("Searching Google Images…")
         if self.yarn_clips:
@@ -205,7 +217,7 @@ class GoogleResults(QObject):
         self.sync()
 
     def append(self, items):
-        fresh = []
+        fresh, enriched = [], {}
         for item in items:
             if self.branch and item.key == self.branch.key:
                 continue
@@ -213,16 +225,24 @@ class GoogleResults(QObject):
                 self.items[item.key] = item
                 self.retained.pop(item.key, None)
                 fresh.append(item)
+            elif item.thumb and not self.items[item.key].thumb:
+                self.items[item.key] = item
+                enriched[item.key] = item
+        if enriched:
+            self.picker.board.update_sources(enriched)
+            self.picker.google_stills_tried.difference_update(enriched)
+            self.picker.schedule_posters()
         if fresh:
             self.picker.consider_search_cover(fresh)
-            self.picker.board.extend(fresh)
+            self.picker.extend_search_results(self.picker.board, fresh)
             self.picker.paint_timer.start()
         return len(fresh)
 
     def near_end(self):
         scroll = self.picker.scroll
         bar = scroll.verticalScrollBar()
-        return bar.maximum() - bar.value() < 2 * max(1, scroll.viewport().height())
+        screens = 1 if self.picker.board.search_gifs else 2
+        return bar.maximum() - bar.value() < screens * max(1, scroll.viewport().height())
 
     def on_scroll(self, value):
         if not self.active or self.paused or self.exhausted or self.blocked:
@@ -253,7 +273,7 @@ class GoogleResults(QObject):
             or not self.auto_left
             or self.empty_rounds >= EMPTY_ROUNDS
             or self.picker.has_draft()
-            or not (self.warm_left or self.near_end())
+            or not (self.near_end() or (self.warm_left and not self.picker.board.search_gifs))
         ):
             return
         if not self.ready:
@@ -300,7 +320,11 @@ class GoogleResults(QObject):
         expected = "initial" if batch.kind == "initial" else "more"
         if self.inflight != expected and not resuming:
             return
-        self.inflight = self.blocked = ""
+        partial = batch.status == "partial"
+        if partial and (self.blocked or self.branch or self.references or batch.kind != "initial"):
+            return
+        if not partial:
+            self.inflight = self.blocked = ""
         if self.yarn_clips:
             self.receive_yarn(batch)
             return
@@ -309,6 +333,13 @@ class GoogleResults(QObject):
         fresh = self.append(batch.items)
         if rendered := getattr(batch, "rendered_thumbnails", None):
             self.rendered_ready(batch.query, rendered)
+        if partial:
+            self.streamed_count += fresh
+            self.picker.update_result_count()
+            return
+        if batch.kind == "initial":
+            fresh += self.streamed_count
+            self.streamed_count = 0
         if self.branch:
             self.receive_branch(batch, fresh)
             return
@@ -460,6 +491,7 @@ class GoogleResults(QObject):
             accepted = self.picker.svc.offer_posters(offered)
             self.late_posters.update(key for key in accepted if key in self.items)
             if accepted:
+                self.picker.board.retry_covers(accepted)
                 self.picker.google_stills_tried.difference_update(accepted)
                 self.picker.schedule_posters()
 
@@ -543,6 +575,7 @@ class GoogleResults(QObject):
     def sync(self):
         if not self.active:
             return
+        self.picker.search_previews.schedule()
         more = self.picker.more
         more.setVisible(self.has_more())
         more.setEnabled(not self.inflight)

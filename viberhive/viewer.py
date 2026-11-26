@@ -41,6 +41,7 @@ class HoverPreview(QWidget):
     def __init__(self):
         super().__init__()
         self.item = self.pixmap = None
+        self.related_pane = None
         self.note = ""
         self.setMinimumWidth(145)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -67,8 +68,22 @@ class HoverPreview(QWidget):
         layout.addWidget(self.caption)
         self.caption.hide()
 
+    def install_related(self, pane):
+        self.related_pane = pane
+        self.layout().addWidget(pane, 1)
+        pane.hide()
+
+    def set_related_visible(self, visible):
+        self.related_pane.setVisible(visible)
+        self.image.setVisible(not visible and not self.clip_player.active)
+        self.clip_player.setVisible(not visible and self.item is not None and self.item.kind == "clip")
+        self.caption.setVisible(not visible and self.item is not None)
+        normal_name = f"Preview of {self.item.title}" if self.item else "GIF preview"
+        self.setAccessibleName("Similar GIFs" if visible else normal_name)
+
     def playback_changed(self, active):
-        self.image.setVisible(not active)
+        showing_related = self.related_pane is not None and not self.related_pane.isHidden()
+        self.image.setVisible(not active and not showing_related)
         self.layout().setStretch(1, int(active))
 
     def fit_caption(self, *_):
@@ -84,6 +99,8 @@ class HoverPreview(QWidget):
         self.fit_caption()
 
     def set_preview(self, item=None, pixmap=None, note=""):
+        if self.related_pane is not None and not self.related_pane.isHidden():
+            return
         if item and item.kind == "clip" and pixmap is None:
             note = ""  # A missing poster says nothing about whether the clip can play.
         changed = item is not self.item or note != self.note

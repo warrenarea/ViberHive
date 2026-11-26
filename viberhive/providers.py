@@ -3,14 +3,14 @@
 import json
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import unescape
 from html.parser import HTMLParser
 from itertools import islice
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
 
 from . import clipcafe, klipy_web, yarn_index
-from .model import Item, Page
+from .model import Item, Page, site_icon_url
 from .net import HTTPProblem, Problem, fetch, host_of, read_json, web_url
 
 GOOGLE = "Google Images"
@@ -283,6 +283,13 @@ def _image_link(value):
     return web_url(value)
 
 
+def _thumbnail_link(value):
+    if isinstance(value, str) and value.startswith("/images?"):
+        value = urljoin("https://www.google.com/", value)
+    url = _image_link(value)
+    return url if url and not site_icon_url(url) else ""
+
+
 class GoogleHTML(HTMLParser):
     """Extract the result card's source, its nested thumbnail and its per-image IDs together."""
 
@@ -374,6 +381,7 @@ class GoogleHTML(HTMLParser):
                     _image_link(first("imgurl")),
                     _image_link(first("imgrefurl")),
                     a.get("aria-label") or a.get("title") or "",
+                    thumb=_thumbnail_link(first("tbnurl")),
                     thumb_id=first("tbnid") or thumb_id,
                     doc_id=first("docid") or ref_id,
                     width=_number(first("w")),
@@ -385,29 +393,35 @@ class GoogleHTML(HTMLParser):
             else:
                 self._next_anchor_page = _image_link(href)
         if a.get("data-iurl") or a.get("data-ou"):
-            self.links.append(
-                _GoogleImage(
-                    _image_link(a.get("data-iurl") or a.get("data-ou")),
-                    source,
-                    a.get("alt") or "",
-                    _image_link(a.get("data-src")),
-                    thumb_id,
-                    ref_id,
-                    _number(a.get("data-ow")),
-                    _number(a.get("data-oh")),
-                )
+            record = _GoogleImage(
+                _image_link(a.get("data-iurl") or a.get("data-ou")), source, a.get("alt") or "",
+                _thumbnail_link(a.get("data-tu") or a.get("data-thumb") or a.get("data-src")),
+                thumb_id, ref_id, _number(a.get("data-ow")), _number(a.get("data-oh")),
             )
-        if tag == "img":
+            self.links.append(record)
+            if tag == "div":
+                self._card_stack[-1] = record
+        if tag in ("img", "source", "video"):
             record = self.anchor or (
                 self._permalink(self._next_anchor_page) if self._next_anchor_page else None
             )
             if record is None and self._card_stack:
                 record = self._card_stack[-1]
-            if record:
-                record.title = record.title or a.get("alt") or ""
-                record.thumb = (
-                    record.thumb or _image_link(a.get("data-src")) or _image_link(a.get("src"))
-                )
+            alt = a.get("alt") or ""
+            if record and not re.fullmatch(r"favicon|(?:site|website|publisher|source) (?:icon|logo)", alt.strip(), re.I):
+                record.title = record.title or alt
+                sources = [a.get(attr) for attr in ("data-src","data-thumb","data-deferred-src","poster")]
+                if tag == "img":
+                    sources.append(a.get("src"))
+                for attr in ("data-srcset", "srcset"):
+                    for entry in (a.get(attr) or "")[:8192].split(",")[:6]:
+                        if candidate := entry.split():
+                            sources.append(candidate[0])
+                for source_url in sources:
+                    thumb = _thumbnail_link(source_url)
+                    if thumb and thumb != record.media:
+                        record.thumb = record.thumb or thumb
+                        break
 
     def handle_data(self, data):
         if self._text_left > 0 and not self._ignored_access_tags and not self._legacy_meta:
@@ -490,7 +504,7 @@ def _embedded_images(markup, parser):
                     _image_link(original),
                     source,
                     title,
-                    _image_link(thumb),
+                    _thumbnail_link(thumb),
                     image_id,
                     ref_id or parser.ref_for_page.get(source, ""),
                     _number(w),
@@ -530,7 +544,10 @@ def parse_google_public(body, query, page=0, related=False):
             else ""
         )
         current = items.get(rec.media)
+        thumb = _thumbnail_link(rec.thumb) if rec.thumb != rec.media else ""
         if current is not None and (not seed or current.seed):
+            if thumb and not current.thumb:
+                items[rec.media] = replace(current, thumb=thumb)
             return
         fallback = unquote(urlsplit(rec.source or rec.media).path).rstrip("/").rsplit("/", 1)[-1]
         title = (
@@ -541,7 +558,7 @@ def parse_google_public(body, query, page=0, related=False):
         items[rec.media] = Item(
             title,
             rec.media,
-            rec.thumb,
+            thumb or (current.thumb if current else ""),
             rec.source,
             GOOGLE,
             seed,

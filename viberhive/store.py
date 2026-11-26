@@ -22,6 +22,13 @@ from .topics import recurring_topics
 MEDIA_TTL = 3 * 86400
 
 
+class FolderNameConflict(ValueError):
+    def __init__(self, folder_id, folder_name):
+        super().__init__("A folder with that name already exists.")
+        self.folder_id = folder_id
+        self.folder_name = folder_name
+
+
 def _file_stamp(path):
     try:
         info = path.lstat()
@@ -60,6 +67,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS gif_usage(
                 id TEXT PRIMARY KEY, info TEXT NOT NULL, uses INTEGER NOT NULL, last_used INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS by_gif_usage ON gif_usage(uses DESC,last_used DESC,id);
+            UPDATE favorites SET poster='gif-cover:' || id WHERE full LIKE 'gif:%' AND poster LIKE 'poster:%';
         """)
         self._ensure_folders()
         self._favorite_topics = {}
@@ -78,18 +86,21 @@ class Store:
         self.prune()
 
     def _ensure_folders(self):
-        # Rebuild the pre-1.9 global unique constraints in a single transaction.
-        # Preserve folder IDs, explicit Unfiled decisions, and the GIF preference.
+        # Preserve existing IDs and filing decisions. New IDs must never reuse a
+        # deleted folder's identity, including while a confirmation dialog is open.
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
+            schema = self.db.execute("SELECT sql FROM sqlite_master WHERE name='favorite_folders'").fetchone()
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(favorite_folders)")}
             legacy = bool(columns) and "kind" not in columns
-            if legacy:
+            rebuild = legacy or (schema is not None and "AUTOINCREMENT" not in schema[0].upper())
+            if rebuild:
                 self.db.execute("ALTER TABLE favorite_filing RENAME TO old_filing")
                 self.db.execute("ALTER TABLE favorite_folders RENAME TO old_folders")
+            if legacy:
                 self.db.execute("ALTER TABLE favorite_preferences RENAME TO old_folder_preferences")
             self.db.execute("""CREATE TABLE IF NOT EXISTS favorite_folders(
-                id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('gif','clip')),
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind IN ('gif','clip')),
                 name TEXT NOT NULL, name_key TEXT NOT NULL, topic TEXT,
                 UNIQUE(kind,name_key), UNIQUE(kind,topic))""")
             self.db.execute("""CREATE TABLE IF NOT EXISTS favorite_filing(
@@ -97,15 +108,26 @@ class Store:
                 folder_id INTEGER REFERENCES favorite_folders(id) ON DELETE SET NULL)""")
             self.db.execute("""CREATE TABLE IF NOT EXISTS favorite_preferences(
                 kind TEXT PRIMARY KEY CHECK(kind IN ('gif','clip')), auto_categorize INTEGER NOT NULL)""")
-            if legacy:
-                self.db.execute("""INSERT INTO favorite_folders(id,kind,name,name_key,topic)
-                    SELECT id,'gif',name,name_key,topic FROM old_folders""")
+            if rebuild:
+                old_kind = "'gif'" if legacy else "kind"
+                self.db.execute(f"""INSERT INTO favorite_folders(id,kind,name,name_key,topic)
+                    SELECT id,{old_kind},name,name_key,topic FROM old_folders""")
                 self.db.execute("INSERT INTO favorite_filing SELECT favorite_id,folder_id FROM old_filing")
-                self.db.execute("INSERT INTO favorite_preferences SELECT 'gif',auto_categorize FROM old_folder_preferences")
                 self.db.execute("DROP TABLE old_filing")
                 self.db.execute("DROP TABLE old_folders")
+            if legacy:
+                self.db.execute("INSERT INTO favorite_preferences SELECT 'gif',auto_categorize FROM old_folder_preferences")
                 self.db.execute("DROP TABLE old_folder_preferences")
             self.db.execute("CREATE INDEX IF NOT EXISTS by_folder ON favorite_filing(folder_id)")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS favorite_folder_merges(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                source_id INTEGER NOT NULL UNIQUE, source_name TEXT NOT NULL, source_key TEXT NOT NULL,
+                source_topic TEXT, destination_id INTEGER, destination_name TEXT NOT NULL)""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS favorite_merge_members(
+                merge_id INTEGER NOT NULL REFERENCES favorite_folder_merges(id) ON DELETE CASCADE,
+                favorite_id TEXT NOT NULL REFERENCES favorites(id) ON DELETE CASCADE,
+                PRIMARY KEY(merge_id, favorite_id))""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS by_merged_favorite ON favorite_merge_members(favorite_id)")
 
     @staticmethod
     def valid_name(digest, ext):
@@ -312,15 +334,18 @@ class Store:
             raise ValueError("That name is reserved for a folder view. Choose another name.")
         return name
 
-    def create_folder(self, name, *, kind="gif", favorite=None):
+    def _insert_folder(self, name, kind):
         name = self._folder_name(name)
+        try:
+            return self.db.execute(
+                "INSERT INTO favorite_folders(kind,name,name_key) VALUES(?,?,?)", (kind, name, name.casefold())
+            ).lastrowid
+        except sqlite3.IntegrityError:
+            raise ValueError("A folder with that name already exists.") from None
+
+    def create_folder(self, name, *, kind="gif", favorite=None):
         with self.lock, self.db:
-            try:
-                folder_id = self.db.execute(
-                    "INSERT INTO favorite_folders(kind,name,name_key) VALUES(?,?,?)", (kind, name, name.casefold())
-                ).lastrowid
-            except sqlite3.IntegrityError:
-                raise ValueError("A folder with that name already exists.") from None
+            folder_id = self._insert_folder(name, kind)
             if favorite is not None:
                 self._set_folder(favorite, folder_id)
             return folder_id
@@ -329,14 +354,82 @@ class Store:
         name = self._folder_name(name)
         with self.lock, self.db:
             try:
-                self.db.execute("UPDATE favorite_folders SET name=?,name_key=? WHERE kind=? AND id=?",
-                                (name, name.casefold(), kind, folder_id))
+                changed = self.db.execute("UPDATE favorite_folders SET name=?,name_key=? WHERE kind=? AND id=?",
+                                          (name, name.casefold(), kind, folder_id))
             except sqlite3.IntegrityError:
-                raise ValueError("A folder with that name already exists.") from None
+                existing = self.db.execute("SELECT id,name FROM favorite_folders WHERE kind=? AND name_key=?",
+                                           (kind, name.casefold())).fetchone()
+                if existing:
+                    raise FolderNameConflict(*existing) from None
+                raise
+            if not changed.rowcount:
+                raise ValueError("This folder no longer exists.")
 
-    def delete_folder(self, folder_id, *, kind="gif"):
+    def merge_folders(self, source_id, destination_id, *, kind="gif", source_name=None, destination_name=None):
+        """Journal exactly the original members, then move them and remove the source atomically."""
         with self.lock, self.db:
-            self.db.execute("DELETE FROM favorite_folders WHERE kind=? AND id=?", (kind, folder_id))
+            self.db.execute("BEGIN IMMEDIATE")
+            source = self.db.execute("SELECT name,name_key,topic FROM favorite_folders WHERE id=? AND kind=?",
+                                     (source_id, kind)).fetchone()
+            dest = self.db.execute("SELECT name FROM favorite_folders WHERE id=? AND kind=?",
+                                   (destination_id, kind)).fetchone()
+            if not source or not dest or source_id == destination_id:
+                raise ValueError("Choose two existing folders in the same collection.")
+            if ((source_name is not None and source_name != source[0]) or
+                    (destination_name is not None and destination_name != dest[0])):
+                raise ValueError("A folder changed while the confirmation was open. Choose the folders again.")
+            merge_id = self.db.execute("""INSERT INTO favorite_folder_merges
+                (kind,source_id,source_name,source_key,source_topic,destination_id,destination_name)
+                VALUES(?,?,?,?,?,?,?)""", (kind, source_id, *source, destination_id, dest[0])).lastrowid
+            self.db.execute("""INSERT INTO favorite_merge_members(merge_id,favorite_id)
+                SELECT ?,favorite_id FROM favorite_filing WHERE folder_id=?""", (merge_id, source_id))
+            self.db.execute("UPDATE favorite_filing SET folder_id=? WHERE folder_id=?", (destination_id, source_id))
+            self.db.execute("DELETE FROM favorite_folders WHERE id=?", (source_id,))
+            return destination_id
+
+    def last_folder_merge(self, kind="gif"):
+        with self.lock:
+            return self.db.execute("""SELECT id,source_name,destination_name FROM favorite_folder_merges
+                WHERE kind=? ORDER BY id DESC LIMIT 1""", (kind,)).fetchone()
+
+    def undo_folder_merge(self, merge_id, *, kind="gif"):
+        """Restore the latest source and its members, preserving subsequent explicit filing decisions."""
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            record = self.db.execute("""SELECT id,source_id,source_name,source_key,source_topic,destination_id
+                FROM favorite_folder_merges WHERE kind=? ORDER BY id DESC LIMIT 1""", (kind,)).fetchone()
+            if not record or record[0] != merge_id:
+                raise ValueError("This is no longer the latest merge. Open Manage folders again.")
+            _, source_id, name, name_key, topic, destination_id = record
+            if self.db.execute("SELECT 1 FROM favorite_folders WHERE kind=? AND name_key=?",
+                               (kind, name_key)).fetchone():
+                raise ValueError(f"Rename the current “{name}” folder before undoing the merge.")
+            # If the destination was deleted, auto-filing may since have adopted the same
+            # subject elsewhere. Preserve that newer assignment, and restore this folder manually.
+            if topic and self.db.execute("SELECT 1 FROM favorite_folders WHERE kind=? AND topic=?",
+                                         (kind, topic)).fetchone():
+                topic = None
+            self.db.execute("INSERT INTO favorite_folders(id,kind,name,name_key,topic) VALUES(?,?,?,?,?)",
+                            (source_id, kind, name, name_key, topic))
+            self.db.execute("""UPDATE favorite_filing SET folder_id=? WHERE folder_id IS ? AND favorite_id IN
+                (SELECT favorite_id FROM favorite_merge_members WHERE merge_id=?)""",
+                            (source_id, destination_id, merge_id))
+            self.db.execute("DELETE FROM favorite_folder_merges WHERE id=?", (merge_id,))
+            return source_id
+
+    def delete_folder(self, folder_id, *, kind="gif", if_empty_named=None):
+        """An empty-folder confirmation applies only while its name and contents still match."""
+        with self.lock, self.db:
+            deleted = self.db.execute("""DELETE FROM favorite_folders WHERE kind=? AND id=?
+                AND (? IS NULL OR (name=? AND NOT EXISTS (
+                    SELECT 1 FROM favorite_filing WHERE folder_id=favorite_folders.id)))""",
+                                      (kind, folder_id, if_empty_named, if_empty_named)).rowcount
+            if not deleted:
+                return False
+            # Explicit deletion puts members in Unfiled; a later reuse of this ID is unrelated.
+            self.db.execute("UPDATE favorite_folder_merges SET destination_id=NULL WHERE kind=? AND destination_id=?",
+                            (kind, folder_id))
+            return True
 
     def folder_for(self, key):
         with self.lock:
@@ -358,10 +451,23 @@ class Store:
         )
         if not cursor.rowcount:
             raise ValueError("Choose a folder from this favorite’s collection.")
+        # A later manual move (including out and back) takes precedence over any past merge.
+        self.db.execute("DELETE FROM favorite_merge_members WHERE favorite_id=?", (key,))
 
-    def move_favorite(self, key, folder_id):
+    def move_favorite(self, key, folder_id, *, new_name=None, kind="gif"):
+        """Move a favorite and return the named folder this move emptied, if any."""
         with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            source_id = self.folder_for(key)
+            if new_name is not None:
+                folder_id = self._insert_folder(new_name, kind)
+            if source_id is not None and source_id == folder_id:
+                return None
             self._set_folder(key, folder_id)
+            if source_id is None:
+                return None
+            return self.db.execute("""SELECT id,name,kind FROM favorite_folders WHERE id=? AND NOT EXISTS
+                (SELECT 1 FROM favorite_filing WHERE folder_id=favorite_folders.id)""", (source_id,)).fetchone()
 
     def auto_categorize_enabled(self, kind="gif"):
         with self.lock:
@@ -388,6 +494,17 @@ class Store:
         row = self.db.execute("SELECT id FROM favorite_folders WHERE kind=? AND topic=?", (kind, topic)).fetchone()
         if row:
             return row[0]  # User renames also apply to future matches.
+        # A source can itself be the destination of an earlier merge. Follow the chain
+        # to a live folder so auto-filing continues to respect the user's grouping.
+        merged = self.db.execute("""WITH RECURSIVE routes(merge_id,folder_id) AS (
+            SELECT id,destination_id FROM favorite_folder_merges
+            WHERE kind=? AND (source_topic=? OR (source_topic IS NULL AND source_key=?))
+            UNION ALL SELECT r.merge_id,m.destination_id FROM routes r
+            JOIN favorite_folder_merges m ON m.source_id=r.folder_id
+        ) SELECT f.id FROM routes r JOIN favorite_folders f ON f.id=r.folder_id
+          ORDER BY r.merge_id DESC LIMIT 1""", (kind, topic, topic.casefold())).fetchone()
+        if merged:
+            return merged[0]
         base = topic.title()
         for number in count(1):
             suffix = "" if number == 1 else f" ({number})"
