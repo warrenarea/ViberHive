@@ -17,14 +17,19 @@ Star a GIF or clip to save it. In **Favorites**, click a colored folder button t
 - Turn on **Auto-Categorize** to group recurring subjects. To file a favorite yourself, right-click it and choose **Move to folder**. If the move empties a folder, you can keep or delete it.
 - To combine folders, rename one to an existing folder’s name and confirm. **Manage folders → Undo Merge** restores the two folders, even after a restart.
 
+## GIF search home
+
+Open the **GIFs** tab with an empty search box to see **Frequently Used**. Drag the **2 rows** handle shown below down to reveal more GIFs or up to show fewer. It moves one row at a time, up to eight rows.
+
+![The GIF search home shows eight frequently used GIFs in two rows. The divider labeled “2 rows” sits just above Favorites and Search Categories.](docs/images/frequently-used.png)
+
 ## Find and preview reactions
 
 - **More like this** opens a related GIF search in the main grid. **Middle-click** a GIF in search or Favorites to browse related GIFs in a separate, scrollable Preview pane while keeping your place. **Auto animate** plays visible GIFs in both grids.
 - Search GIFs with Google Images, Wikimedia Commons, or KLIPY. Google’s **Visually similar images** searches by appearance. In **Clips**, search Yarn or Clip.Cafe by dialogue, preview the scene, and paste its link.
-- On the GIF home screen, drag the divider below **Frequently Used** to show up to eight rows. Reaction and category shortcuts start a new search.
 
 ![A related GIF search in Preview beside the original search results.](docs/images/related-preview.png)
 
 If Google asks for verification, choose **Verify with Google**. If it still requests sign-in, use **Open in browser** or **Search KLIPY**. To save a GIF by its original image address, use **Add GIF by URL** in Favorites.
 
-Favorites, settings, history, and cached media are stored in `%LOCALAPPDATA%\ViberHive`. Quit from the tray before copying that folder for a backup. Search providers receive your queries. The screenshots use sample favorites.
+Favorites, settings, history, and cached media are stored in %LOCALAPPDATA%\ViberHive. Quit from the tray before copying that folder for a backup. Search providers receive your queries. The screenshots use sample favorites.
